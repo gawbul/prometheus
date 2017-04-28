@@ -347,7 +347,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		Birth         time.Time
 		CWD           string
 		Version       *PrometheusVersion
-		Alertmanagers []string
+		Alertmanagers []*url.URL
 	}{
 		Birth:         h.birth,
 		CWD:           h.cwd,
@@ -377,6 +377,12 @@ func (h *Handler) targets(w http.ResponseWriter, r *http.Request) {
 	for _, t := range h.targetManager.Targets() {
 		job := string(t.Labels()[model.JobLabel])
 		tps[job] = append(tps[job], t)
+	}
+
+	for _, targets := range tps {
+		sort.Slice(targets, func(i, j int) bool {
+			return targets[i].Labels()[model.InstanceLabel] < targets[j].Labels()[model.InstanceLabel]
+		})
 	}
 
 	h.executeTemplate(w, "targets.html", struct {
@@ -425,6 +431,7 @@ func tmplFuncs(consolesPath string, opts *Options) template_text.FuncMap {
 		},
 		"consolesPath": func() string { return consolesPath },
 		"pathPrefix":   func() string { return opts.ExternalURL.Path },
+		"buildVersion": func() string { return opts.Version.Revision },
 		"stripLabels": func(lset model.LabelSet, labels ...model.LabelName) model.LabelSet {
 			for _, ln := range labels {
 				delete(lset, ln)

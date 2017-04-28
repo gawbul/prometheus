@@ -59,7 +59,7 @@ var (
 			Namespace:   namespace,
 			Subsystem:   subsystem,
 			Name:        "query_duration_seconds",
-			Help:        "Query timmings",
+			Help:        "Query timings",
 			ConstLabels: prometheus.Labels{"slice": "prepare_time"},
 		},
 	)
@@ -68,7 +68,7 @@ var (
 			Namespace:   namespace,
 			Subsystem:   subsystem,
 			Name:        "query_duration_seconds",
-			Help:        "Query timmings",
+			Help:        "Query timings",
 			ConstLabels: prometheus.Labels{"slice": "inner_eval"},
 		},
 	)
@@ -77,7 +77,7 @@ var (
 			Namespace:   namespace,
 			Subsystem:   subsystem,
 			Name:        "query_duration_seconds",
-			Help:        "Query timmings",
+			Help:        "Query timings",
 			ConstLabels: prometheus.Labels{"slice": "result_append"},
 		},
 	)
@@ -86,7 +86,7 @@ var (
 			Namespace:   namespace,
 			Subsystem:   subsystem,
 			Name:        "query_duration_seconds",
-			Help:        "Query timmings",
+			Help:        "Query timings",
 			ConstLabels: prometheus.Labels{"slice": "result_sort"},
 		},
 	)
@@ -217,6 +217,9 @@ type (
 	ErrQueryTimeout string
 	// ErrQueryCanceled is returned if a query was canceled during processing.
 	ErrQueryCanceled string
+	// ErrStorage is returned if an error was encountered in the storage layer
+	// during query handling.
+	ErrStorage error
 )
 
 func (e ErrQueryTimeout) Error() string  { return fmt.Sprintf("query timed out in %s", string(e)) }

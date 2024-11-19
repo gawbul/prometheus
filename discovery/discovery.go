@@ -1,4 +1,4 @@
-// Copyright 2016 The Prometheus Authors
+// Copyright 2020 The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,295 +14,151 @@
 package discovery
 
 import (
-	"fmt"
-	"sync"
-	"time"
+	"context"
+	"log/slog"
+	"reflect"
 
-	"github.com/prometheus/common/log"
-	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/discovery/azure"
-	"github.com/prometheus/prometheus/discovery/consul"
-	"github.com/prometheus/prometheus/discovery/dns"
-	"github.com/prometheus/prometheus/discovery/ec2"
-	"github.com/prometheus/prometheus/discovery/file"
-	"github.com/prometheus/prometheus/discovery/gce"
-	"github.com/prometheus/prometheus/discovery/kubernetes"
-	"github.com/prometheus/prometheus/discovery/marathon"
-	"github.com/prometheus/prometheus/discovery/triton"
-	"github.com/prometheus/prometheus/discovery/zookeeper"
-	"golang.org/x/net/context"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/config"
+
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
-// A TargetProvider provides information about target groups. It maintains a set
-// of sources from which TargetGroups can originate. Whenever a target provider
-// detects a potential change, it sends the TargetGroup through its provided channel.
+// Discoverer provides information about target groups. It maintains a set
+// of sources from which TargetGroups can originate. Whenever a discovery provider
+// detects a potential change, it sends the TargetGroup through its channel.
 //
-// The TargetProvider does not have to guarantee that an actual change happened.
+// Discoverer does not know if an actual change happened.
 // It does guarantee that it sends the new TargetGroup whenever a change happens.
 //
-// TargetProviders should initially send a full set of all discoverable TargetGroups.
-type TargetProvider interface {
-	// Run hands a channel to the target provider through which it can send
-	// updated target groups.
-	// Must returns if the context gets canceled. It should not close the update
-	// channel on returning.
-	Run(ctx context.Context, up chan<- []*config.TargetGroup)
+// Discoverers should initially send a full set of all discoverable TargetGroups.
+type Discoverer interface {
+	// Run hands a channel to the discovery provider (Consul, DNS, etc.) through which
+	// it can send updated target groups. It must return when the context is canceled.
+	// It should not close the update channel on returning.
+	Run(ctx context.Context, up chan<- []*targetgroup.Group)
 }
 
-// ProvidersFromConfig returns all TargetProviders configured in cfg.
-func ProvidersFromConfig(cfg config.ServiceDiscoveryConfig) map[string]TargetProvider {
-	providers := map[string]TargetProvider{}
-
-	app := func(mech string, i int, tp TargetProvider) {
-		providers[fmt.Sprintf("%s/%d", mech, i)] = tp
-	}
-
-	for i, c := range cfg.DNSSDConfigs {
-		app("dns", i, dns.NewDiscovery(c))
-	}
-	for i, c := range cfg.FileSDConfigs {
-		app("file", i, file.NewDiscovery(c))
-	}
-	for i, c := range cfg.ConsulSDConfigs {
-		k, err := consul.NewDiscovery(c)
-		if err != nil {
-			log.Errorf("Cannot create Consul discovery: %s", err)
-			continue
-		}
-		app("consul", i, k)
-	}
-	for i, c := range cfg.MarathonSDConfigs {
-		m, err := marathon.NewDiscovery(c)
-		if err != nil {
-			log.Errorf("Cannot create Marathon discovery: %s", err)
-			continue
-		}
-		app("marathon", i, m)
-	}
-	for i, c := range cfg.KubernetesSDConfigs {
-		k, err := kubernetes.New(log.Base(), c)
-		if err != nil {
-			log.Errorf("Cannot create Kubernetes discovery: %s", err)
-			continue
-		}
-		app("kubernetes", i, k)
-	}
-	for i, c := range cfg.ServersetSDConfigs {
-		app("serverset", i, zookeeper.NewServersetDiscovery(c))
-	}
-	for i, c := range cfg.NerveSDConfigs {
-		app("nerve", i, zookeeper.NewNerveDiscovery(c))
-	}
-	for i, c := range cfg.EC2SDConfigs {
-		app("ec2", i, ec2.NewDiscovery(c))
-	}
-	for i, c := range cfg.GCESDConfigs {
-		gced, err := gce.NewDiscovery(c)
-		if err != nil {
-			log.Errorf("Cannot initialize GCE discovery: %s", err)
-			continue
-		}
-		app("gce", i, gced)
-	}
-	for i, c := range cfg.AzureSDConfigs {
-		app("azure", i, azure.NewDiscovery(c))
-	}
-	for i, c := range cfg.TritonSDConfigs {
-		t, err := triton.New(log.With("sd", "triton"), c)
-		if err != nil {
-			log.Errorf("Cannot create Triton discovery: %s", err)
-			continue
-		}
-		app("triton", i, t)
-	}
-	if len(cfg.StaticConfigs) > 0 {
-		app("static", 0, NewStaticProvider(cfg.StaticConfigs))
-	}
-
-	return providers
+// DiscovererMetrics are internal metrics of service discovery mechanisms.
+type DiscovererMetrics interface {
+	Register() error
+	Unregister()
 }
 
-// StaticProvider holds a list of target groups that never change.
-type StaticProvider struct {
-	TargetGroups []*config.TargetGroup
+// DiscovererOptions provides options for a Discoverer.
+type DiscovererOptions struct {
+	Logger *slog.Logger
+
+	Metrics DiscovererMetrics
+
+	// Extra HTTP client options to expose to Discoverers. This field may be
+	// ignored; Discoverer implementations must opt-in to reading it.
+	HTTPClientOptions []config.HTTPClientOption
 }
 
-// NewStaticProvider returns a StaticProvider configured with the given
-// target groups.
-func NewStaticProvider(groups []*config.TargetGroup) *StaticProvider {
-	for i, tg := range groups {
-		tg.Source = fmt.Sprintf("%d", i)
+// RefreshMetrics are used by the "refresh" package.
+// We define them here in the "discovery" package in order to avoid a cyclic dependency between
+// "discovery" and "refresh".
+type RefreshMetrics struct {
+	Failures prometheus.Counter
+	Duration prometheus.Observer
+}
+
+// RefreshMetricsInstantiator instantiates the metrics used by the "refresh" package.
+type RefreshMetricsInstantiator interface {
+	Instantiate(mech string) *RefreshMetrics
+}
+
+// RefreshMetricsManager is an interface for registering, unregistering, and
+// instantiating metrics for the "refresh" package. Refresh metrics are
+// registered and unregistered outside of the service discovery mechanism. This
+// is so that the same metrics can be reused across different service discovery
+// mechanisms. To manage refresh metrics inside the SD mechanism, we'd need to
+// use const labels which are specific to that SD. However, doing so would also
+// expose too many unused metrics on the Prometheus /metrics endpoint.
+type RefreshMetricsManager interface {
+	DiscovererMetrics
+	RefreshMetricsInstantiator
+}
+
+// A Config provides the configuration and constructor for a Discoverer.
+type Config interface {
+	// Name returns the name of the discovery mechanism.
+	Name() string
+
+	// NewDiscoverer returns a Discoverer for the Config
+	// with the given DiscovererOptions.
+	NewDiscoverer(DiscovererOptions) (Discoverer, error)
+
+	// NewDiscovererMetrics returns the metrics used by the service discovery.
+	NewDiscovererMetrics(prometheus.Registerer, RefreshMetricsInstantiator) DiscovererMetrics
+}
+
+// Configs is a slice of Config values that uses custom YAML marshaling and unmarshaling
+// to represent itself as a mapping of the Config values grouped by their types.
+type Configs []Config
+
+// SetDirectory joins any relative file paths with dir.
+func (c *Configs) SetDirectory(dir string) {
+	for _, c := range *c {
+		if v, ok := c.(config.DirectorySetter); ok {
+			v.SetDirectory(dir)
+		}
 	}
-	return &StaticProvider{groups}
 }
 
-// Run implements the TargetProvider interface.
-func (sd *StaticProvider) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
-	// We still have to consider that the consumer exits right away in which case
-	// the context will be canceled.
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (c *Configs) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	cfgTyp := reflect.StructOf(configFields)
+	cfgPtr := reflect.New(cfgTyp)
+	cfgVal := cfgPtr.Elem()
+
+	if err := unmarshal(cfgPtr.Interface()); err != nil {
+		return replaceYAMLTypeError(err, cfgTyp, configsType)
+	}
+
+	var err error
+	*c, err = readConfigs(cfgVal, 0)
+	return err
+}
+
+// MarshalYAML implements yaml.Marshaler.
+func (c Configs) MarshalYAML() (interface{}, error) {
+	cfgTyp := reflect.StructOf(configFields)
+	cfgPtr := reflect.New(cfgTyp)
+	cfgVal := cfgPtr.Elem()
+
+	if err := writeConfigs(cfgVal, c); err != nil {
+		return nil, err
+	}
+
+	return cfgPtr.Interface(), nil
+}
+
+// A StaticConfig is a Config that provides a static list of targets.
+type StaticConfig []*targetgroup.Group
+
+// Name returns the name of the service discovery mechanism.
+func (StaticConfig) Name() string { return "static" }
+
+// NewDiscoverer returns a Discoverer for the Config.
+func (c StaticConfig) NewDiscoverer(DiscovererOptions) (Discoverer, error) {
+	return staticDiscoverer(c), nil
+}
+
+// NewDiscovererMetrics returns NoopDiscovererMetrics because no metrics are
+// needed for this service discovery mechanism.
+func (c StaticConfig) NewDiscovererMetrics(prometheus.Registerer, RefreshMetricsInstantiator) DiscovererMetrics {
+	return &NoopDiscovererMetrics{}
+}
+
+type staticDiscoverer []*targetgroup.Group
+
+func (c staticDiscoverer) Run(ctx context.Context, up chan<- []*targetgroup.Group) {
+	// TODO: existing implementation closes up chan, but documentation explicitly forbids it...?
+	defer close(up)
 	select {
-	case ch <- sd.TargetGroups:
 	case <-ctx.Done():
+	case up <- c:
 	}
-	close(ch)
-}
-
-// TargetSet handles multiple TargetProviders and sends a full overview of their
-// discovered TargetGroups to a Syncer.
-type TargetSet struct {
-	mtx sync.RWMutex
-	// Sets of targets by a source string that is unique across target providers.
-	tgroups map[string]*config.TargetGroup
-
-	syncer Syncer
-
-	syncCh          chan struct{}
-	providerCh      chan map[string]TargetProvider
-	cancelProviders func()
-}
-
-// Syncer receives updates complete sets of TargetGroups.
-type Syncer interface {
-	Sync([]*config.TargetGroup)
-}
-
-// NewTargetSet returns a new target sending TargetGroups to the Syncer.
-func NewTargetSet(s Syncer) *TargetSet {
-	return &TargetSet{
-		syncCh:     make(chan struct{}, 1),
-		providerCh: make(chan map[string]TargetProvider),
-		syncer:     s,
-	}
-}
-
-// Run starts the processing of target providers and their updates.
-// It blocks until the context gets canceled.
-func (ts *TargetSet) Run(ctx context.Context) {
-Loop:
-	for {
-		// Throttle syncing to once per five seconds.
-		select {
-		case <-ctx.Done():
-			break Loop
-		case p := <-ts.providerCh:
-			ts.updateProviders(ctx, p)
-		case <-time.After(5 * time.Second):
-		}
-
-		select {
-		case <-ctx.Done():
-			break Loop
-		case <-ts.syncCh:
-			ts.sync()
-		case p := <-ts.providerCh:
-			ts.updateProviders(ctx, p)
-		}
-	}
-}
-
-func (ts *TargetSet) sync() {
-	ts.mtx.RLock()
-	var all []*config.TargetGroup
-	for _, tg := range ts.tgroups {
-		all = append(all, tg)
-	}
-	ts.mtx.RUnlock()
-
-	ts.syncer.Sync(all)
-}
-
-// UpdateProviders sets new target providers for the target set.
-func (ts *TargetSet) UpdateProviders(p map[string]TargetProvider) {
-	ts.providerCh <- p
-}
-
-func (ts *TargetSet) updateProviders(ctx context.Context, providers map[string]TargetProvider) {
-
-	// Stop all previous target providers of the target set.
-	if ts.cancelProviders != nil {
-		ts.cancelProviders()
-	}
-	ctx, ts.cancelProviders = context.WithCancel(ctx)
-
-	var wg sync.WaitGroup
-	// (Re-)create a fresh tgroups map to not keep stale targets around. We
-	// will retrieve all targets below anyway, so cleaning up everything is
-	// safe and doesn't inflict any additional cost.
-	ts.mtx.Lock()
-	ts.tgroups = map[string]*config.TargetGroup{}
-	ts.mtx.Unlock()
-
-	for name, prov := range providers {
-		wg.Add(1)
-
-		updates := make(chan []*config.TargetGroup)
-		go prov.Run(ctx, updates)
-
-		go func(name string, prov TargetProvider) {
-			select {
-			case <-ctx.Done():
-			case initial, ok := <-updates:
-				// Handle the case that a target provider exits and closes the channel
-				// before the context is done.
-				if !ok {
-					break
-				}
-				// First set of all targets the provider knows.
-				for _, tgroup := range initial {
-					ts.setTargetGroup(name, tgroup)
-				}
-			case <-time.After(5 * time.Second):
-				// Initial set didn't arrive. Act as if it was empty
-				// and wait for updates later on.
-			}
-			wg.Done()
-
-			// Start listening for further updates.
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case tgs, ok := <-updates:
-					// Handle the case that a target provider exits and closes the channel
-					// before the context is done.
-					if !ok {
-						return
-					}
-					for _, tg := range tgs {
-						ts.update(name, tg)
-					}
-				}
-			}
-		}(name, prov)
-	}
-
-	// We wait for a full initial set of target groups before releasing the mutex
-	// to ensure the initial sync is complete and there are no races with subsequent updates.
-	wg.Wait()
-	// Just signal that there are initial sets to sync now. Actual syncing must only
-	// happen in the runScraping loop.
-	select {
-	case ts.syncCh <- struct{}{}:
-	default:
-	}
-}
-
-// update handles a target group update from a target provider identified by the name.
-func (ts *TargetSet) update(name string, tgroup *config.TargetGroup) {
-	ts.setTargetGroup(name, tgroup)
-
-	select {
-	case ts.syncCh <- struct{}{}:
-	default:
-	}
-}
-
-func (ts *TargetSet) setTargetGroup(name string, tg *config.TargetGroup) {
-	ts.mtx.Lock()
-	defer ts.mtx.Unlock()
-
-	if tg == nil {
-		return
-	}
-	ts.tgroups[name+"/"+tg.Source] = tg
 }

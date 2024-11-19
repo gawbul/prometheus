@@ -14,100 +14,176 @@
 package rules
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"html/template"
+	"net/url"
+	"time"
 
-	"github.com/prometheus/common/model"
-	"golang.org/x/net/context"
+	"go.uber.org/atomic"
+	"gopkg.in/yaml.v2"
 
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/util/strutil"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 // A RecordingRule records its vector expression into new timeseries.
 type RecordingRule struct {
 	name   string
-	vector promql.Expr
-	labels model.LabelSet
+	vector parser.Expr
+	labels labels.Labels
+	// The health of the recording rule.
+	health *atomic.String
+	// Timestamp of last evaluation of the recording rule.
+	evaluationTimestamp *atomic.Time
+	// The last error seen by the recording rule.
+	lastError *atomic.Error
+	// Duration of how long it took to evaluate the recording rule.
+	evaluationDuration *atomic.Duration
+
+	noDependentRules  *atomic.Bool
+	noDependencyRules *atomic.Bool
 }
 
 // NewRecordingRule returns a new recording rule.
-func NewRecordingRule(name string, vector promql.Expr, labels model.LabelSet) *RecordingRule {
+func NewRecordingRule(name string, vector parser.Expr, lset labels.Labels) *RecordingRule {
 	return &RecordingRule{
-		name:   name,
-		vector: vector,
-		labels: labels,
+		name:                name,
+		vector:              vector,
+		labels:              lset,
+		health:              atomic.NewString(string(HealthUnknown)),
+		evaluationTimestamp: atomic.NewTime(time.Time{}),
+		evaluationDuration:  atomic.NewDuration(0),
+		lastError:           atomic.NewError(nil),
+		noDependentRules:    atomic.NewBool(false),
+		noDependencyRules:   atomic.NewBool(false),
 	}
 }
 
 // Name returns the rule name.
-func (rule RecordingRule) Name() string {
+func (rule *RecordingRule) Name() string {
 	return rule.name
 }
 
+// Query returns the rule query expression.
+func (rule *RecordingRule) Query() parser.Expr {
+	return rule.vector
+}
+
+// Labels returns the rule labels.
+func (rule *RecordingRule) Labels() labels.Labels {
+	return rule.labels
+}
+
 // Eval evaluates the rule and then overrides the metric names and labels accordingly.
-func (rule RecordingRule) Eval(ctx context.Context, timestamp model.Time, engine *promql.Engine, _ string) (model.Vector, error) {
-	query, err := engine.NewInstantQuery(rule.vector.String(), timestamp)
+func (rule *RecordingRule) Eval(ctx context.Context, queryOffset time.Duration, ts time.Time, query QueryFunc, _ *url.URL, limit int) (promql.Vector, error) {
+	ctx = NewOriginContext(ctx, NewRuleDetail(rule))
+	vector, err := query(ctx, rule.vector.String(), ts.Add(-queryOffset))
 	if err != nil {
 		return nil, err
 	}
 
-	var (
-		result = query.Exec(ctx)
-		vector model.Vector
-	)
-	if result.Err != nil {
-		return nil, err
-	}
-
-	switch result.Value.(type) {
-	case model.Vector:
-		vector, err = result.Vector()
-		if err != nil {
-			return nil, err
-		}
-	case *model.Scalar:
-		scalar, err := result.Scalar()
-		if err != nil {
-			return nil, err
-		}
-		vector = model.Vector{&model.Sample{
-			Value:     scalar.Value,
-			Timestamp: scalar.Timestamp,
-			Metric:    model.Metric{},
-		}}
-	default:
-		return nil, fmt.Errorf("rule result is not a vector or scalar")
-	}
-
 	// Override the metric name and labels.
-	for _, sample := range vector {
-		sample.Metric[model.MetricNameLabel] = model.LabelValue(rule.name)
+	lb := labels.NewBuilder(labels.EmptyLabels())
 
-		for label, value := range rule.labels {
-			if value == "" {
-				delete(sample.Metric, label)
-			} else {
-				sample.Metric[label] = value
-			}
-		}
+	for i := range vector {
+		sample := &vector[i]
+
+		lb.Reset(sample.Metric)
+		lb.Set(labels.MetricName, rule.name)
+
+		rule.labels.Range(func(l labels.Label) {
+			lb.Set(l.Name, l.Value)
+		})
+
+		sample.Metric = lb.Labels()
 	}
 
+	// Check that the rule does not produce identical metrics after applying
+	// labels.
+	if vector.ContainsSameLabelset() {
+		return nil, errors.New("vector contains metrics with the same labelset after applying rule labels")
+	}
+
+	numSeries := len(vector)
+	if limit > 0 && numSeries > limit {
+		return nil, fmt.Errorf("exceeded limit of %d with %d series", limit, numSeries)
+	}
+
+	rule.SetHealth(HealthGood)
+	rule.SetLastError(err)
 	return vector, nil
 }
 
-func (rule RecordingRule) String() string {
-	return fmt.Sprintf("%s%s = %s\n", rule.name, rule.labels, rule.vector)
+func (rule *RecordingRule) String() string {
+	r := rulefmt.Rule{
+		Record: rule.name,
+		Expr:   rule.vector.String(),
+		Labels: rule.labels.Map(),
+	}
+
+	byt, err := yaml.Marshal(r)
+	if err != nil {
+		return fmt.Sprintf("error marshaling recording rule: %q", err.Error())
+	}
+
+	return string(byt)
 }
 
-// HTMLSnippet returns an HTML snippet representing this rule.
-func (rule RecordingRule) HTMLSnippet(pathPrefix string) template.HTML {
-	ruleExpr := rule.vector.String()
-	return template.HTML(fmt.Sprintf(
-		`<a href="%s">%s</a>%s = <a href="%s">%s</a>`,
-		pathPrefix+strutil.GraphLinkForExpression(rule.name),
-		rule.name,
-		template.HTMLEscapeString(rule.labels.String()),
-		pathPrefix+strutil.GraphLinkForExpression(ruleExpr),
-		template.HTMLEscapeString(ruleExpr)))
+// SetEvaluationDuration updates evaluationDuration to the time in seconds it took to evaluate the rule on its last evaluation.
+func (rule *RecordingRule) SetEvaluationDuration(dur time.Duration) {
+	rule.evaluationDuration.Store(dur)
+}
+
+// SetLastError sets the current error seen by the recording rule.
+func (rule *RecordingRule) SetLastError(err error) {
+	rule.lastError.Store(err)
+}
+
+// LastError returns the last error seen by the recording rule.
+func (rule *RecordingRule) LastError() error {
+	return rule.lastError.Load()
+}
+
+// SetHealth sets the current health of the recording rule.
+func (rule *RecordingRule) SetHealth(health RuleHealth) {
+	rule.health.Store(string(health))
+}
+
+// Health returns the current health of the recording rule.
+func (rule *RecordingRule) Health() RuleHealth {
+	return RuleHealth(rule.health.Load())
+}
+
+// GetEvaluationDuration returns the time in seconds it took to evaluate the recording rule.
+func (rule *RecordingRule) GetEvaluationDuration() time.Duration {
+	return rule.evaluationDuration.Load()
+}
+
+// SetEvaluationTimestamp updates evaluationTimestamp to the timestamp of when the rule was last evaluated.
+func (rule *RecordingRule) SetEvaluationTimestamp(ts time.Time) {
+	rule.evaluationTimestamp.Store(ts)
+}
+
+// GetEvaluationTimestamp returns the time the evaluation took place.
+func (rule *RecordingRule) GetEvaluationTimestamp() time.Time {
+	return rule.evaluationTimestamp.Load()
+}
+
+func (rule *RecordingRule) SetNoDependentRules(noDependentRules bool) {
+	rule.noDependentRules.Store(noDependentRules)
+}
+
+func (rule *RecordingRule) NoDependentRules() bool {
+	return rule.noDependentRules.Load()
+}
+
+func (rule *RecordingRule) SetNoDependencyRules(noDependencyRules bool) {
+	rule.noDependencyRules.Store(noDependencyRules)
+}
+
+func (rule *RecordingRule) NoDependencyRules() bool {
+	return rule.noDependencyRules.Load()
 }

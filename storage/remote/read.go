@@ -14,88 +14,162 @@
 package remote
 
 import (
-	"sync"
-	"time"
+	"context"
+	"errors"
+	"fmt"
 
-	"github.com/prometheus/common/model"
-	"golang.org/x/net/context"
-
-	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/storage/local"
-	"github.com/prometheus/prometheus/storage/metric"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 )
 
-// Reader allows reading from multiple remote sources.
-type Reader struct {
-	mtx            sync.Mutex
-	clients        []*Client
-	externalLabels model.LabelSet
+type sampleAndChunkQueryableClient struct {
+	client           ReadClient
+	externalLabels   labels.Labels
+	requiredMatchers []*labels.Matcher
+	readRecent       bool
+	callback         startTimeCallback
 }
 
-// ApplyConfig updates the state as the new config requires.
-func (r *Reader) ApplyConfig(conf *config.Config) error {
-	clients := []*Client{}
-	for i, rrConf := range conf.RemoteReadConfigs {
-		c, err := NewClient(i, &clientConfig{
-			url:              rrConf.URL,
-			timeout:          rrConf.RemoteTimeout,
-			httpClientConfig: rrConf.HTTPClientConfig,
-		})
-		if err != nil {
-			return err
-		}
-		clients = append(clients, c)
+// NewSampleAndChunkQueryableClient returns a storage.SampleAndChunkQueryable which queries the given client to select series sets.
+func NewSampleAndChunkQueryableClient(
+	c ReadClient,
+	externalLabels labels.Labels,
+	requiredMatchers []*labels.Matcher,
+	readRecent bool,
+	callback startTimeCallback,
+) storage.SampleAndChunkQueryable {
+	return &sampleAndChunkQueryableClient{
+		client: c,
+
+		externalLabels:   externalLabels,
+		requiredMatchers: requiredMatchers,
+		readRecent:       readRecent,
+		callback:         callback,
+	}
+}
+
+func (c *sampleAndChunkQueryableClient) Querier(mint, maxt int64) (storage.Querier, error) {
+	q := &querier{
+		mint:             mint,
+		maxt:             maxt,
+		client:           c.client,
+		externalLabels:   c.externalLabels,
+		requiredMatchers: c.requiredMatchers,
+	}
+	if c.readRecent {
+		return q, nil
 	}
 
-	r.mtx.Lock()
-	defer r.mtx.Unlock()
-
-	r.clients = clients
-	r.externalLabels = conf.GlobalConfig.ExternalLabels
-
-	return nil
-}
-
-// Queriers returns a list of Queriers for the currently configured
-// remote read endpoints.
-func (r *Reader) Queriers() []local.Querier {
-	r.mtx.Lock()
-	defer r.mtx.Unlock()
-
-	queriers := make([]local.Querier, 0, len(r.clients))
-	for _, c := range r.clients {
-		queriers = append(queriers, &querier{
-			client:         c,
-			externalLabels: r.externalLabels,
-		})
-	}
-	return queriers
-}
-
-// querier is an adapter to make a Client usable as a promql.Querier.
-type querier struct {
-	client         *Client
-	externalLabels model.LabelSet
-}
-
-func (q *querier) QueryRange(ctx context.Context, from, through model.Time, matchers ...*metric.LabelMatcher) ([]local.SeriesIterator, error) {
-	return MatrixToIterators(q.read(ctx, from, through, matchers))
-}
-
-func (q *querier) QueryInstant(ctx context.Context, ts model.Time, stalenessDelta time.Duration, matchers ...*metric.LabelMatcher) ([]local.SeriesIterator, error) {
-	return MatrixToIterators(q.read(ctx, ts.Add(-stalenessDelta), ts, matchers))
-}
-
-func (q *querier) read(ctx context.Context, from, through model.Time, matchers metric.LabelMatchers) (model.Matrix, error) {
-	m, added := q.addExternalLabels(matchers)
-
-	res, err := q.client.Read(ctx, from, through, m)
+	var (
+		noop bool
+		err  error
+	)
+	q.maxt, noop, err = c.preferLocalStorage(mint, maxt)
 	if err != nil {
 		return nil, err
 	}
+	if noop {
+		return storage.NoopQuerier(), nil
+	}
+	return q, nil
+}
 
-	removeLabels(res, added)
-	return res, err
+func (c *sampleAndChunkQueryableClient) ChunkQuerier(mint, maxt int64) (storage.ChunkQuerier, error) {
+	cq := &chunkQuerier{
+		querier: querier{
+			mint:             mint,
+			maxt:             maxt,
+			client:           c.client,
+			externalLabels:   c.externalLabels,
+			requiredMatchers: c.requiredMatchers,
+		},
+	}
+	if c.readRecent {
+		return cq, nil
+	}
+
+	var (
+		noop bool
+		err  error
+	)
+	cq.querier.maxt, noop, err = c.preferLocalStorage(mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	if noop {
+		return storage.NoopChunkedQuerier(), nil
+	}
+	return cq, nil
+}
+
+// preferLocalStorage returns noop if requested timeframe can be answered completely by the local TSDB, and
+// reduces maxt if the timeframe can be partially answered by TSDB.
+func (c *sampleAndChunkQueryableClient) preferLocalStorage(mint, maxt int64) (cmaxt int64, noop bool, err error) {
+	localStartTime, err := c.callback()
+	if err != nil {
+		return 0, false, err
+	}
+	cmaxt = maxt
+
+	// Avoid queries whose time range is later than the first timestamp in local DB.
+	if mint > localStartTime {
+		return 0, true, nil
+	}
+	// Query only samples older than the first timestamp in local DB.
+	if maxt > localStartTime {
+		cmaxt = localStartTime
+	}
+	return cmaxt, false, nil
+}
+
+type querier struct {
+	mint, maxt int64
+	client     ReadClient
+
+	// Derived from configuration.
+	externalLabels   labels.Labels
+	requiredMatchers []*labels.Matcher
+}
+
+// Select implements storage.Querier and uses the given matchers to read series sets from the client.
+// Select also adds equality matchers for all external labels to the list of matchers before calling remote endpoint.
+// The added external labels are removed from the returned series sets.
+//
+// If requiredMatchers are given, select returns a NoopSeriesSet if the given matchers don't match the label set of the
+// requiredMatchers. Otherwise it'll just call remote endpoint.
+func (q *querier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	if len(q.requiredMatchers) > 0 {
+		// Copy to not modify slice configured by user.
+		requiredMatchers := append([]*labels.Matcher{}, q.requiredMatchers...)
+		for _, m := range matchers {
+			for i, r := range requiredMatchers {
+				if m.Type == labels.MatchEqual && m.Name == r.Name && m.Value == r.Value {
+					// Requirement matched.
+					requiredMatchers = append(requiredMatchers[:i], requiredMatchers[i+1:]...)
+					break
+				}
+			}
+			if len(requiredMatchers) == 0 {
+				break
+			}
+		}
+		if len(requiredMatchers) > 0 {
+			return storage.NoopSeriesSet()
+		}
+	}
+
+	m, added := q.addExternalLabels(matchers)
+	query, err := ToQuery(q.mint, q.maxt, m, hints)
+	if err != nil {
+		return storage.ErrSeriesSet(fmt.Errorf("toQuery: %w", err))
+	}
+
+	res, err := q.client.Read(ctx, query, sortSeries)
+	if err != nil {
+		return storage.ErrSeriesSet(fmt.Errorf("remote_read: %w", err))
+	}
+	return newSeriesSetFilter(res, added)
 }
 
 // addExternalLabels adds matchers for each external label. External labels
@@ -104,66 +178,103 @@ func (q *querier) read(ctx context.Context, from, through model.Time, matchers m
 // We return the new set of matchers, along with a map of labels for which
 // matchers were added, so that these can later be removed from the result
 // time series again.
-func (q *querier) addExternalLabels(matchers metric.LabelMatchers) (metric.LabelMatchers, model.LabelSet) {
-	el := make(model.LabelSet, len(q.externalLabels))
-	for k, v := range q.externalLabels {
-		el[k] = v
-	}
-	for _, m := range matchers {
-		if _, ok := el[m.Name]; ok {
-			delete(el, m.Name)
+func (q querier) addExternalLabels(ms []*labels.Matcher) ([]*labels.Matcher, []string) {
+	el := make([]labels.Label, 0, q.externalLabels.Len())
+	q.externalLabels.Range(func(l labels.Label) {
+		el = append(el, l)
+	})
+
+	// ms won't be sorted, so have to O(n^2) the search.
+	for _, m := range ms {
+		for i := 0; i < len(el); {
+			if el[i].Name == m.Name {
+				el = el[:i+copy(el[i:], el[i+1:])]
+				continue
+			}
+			i++
 		}
 	}
 
-	for k, v := range el {
-		m, err := metric.NewLabelMatcher(metric.Equal, k, v)
+	for _, l := range el {
+		m, err := labels.NewMatcher(labels.MatchEqual, l.Name, l.Value)
 		if err != nil {
 			panic(err)
 		}
-		matchers = append(matchers, m)
+		ms = append(ms, m)
 	}
-
-	return matchers, el
-}
-
-func removeLabels(m model.Matrix, labels model.LabelSet) {
-	for _, ss := range m {
-		for k := range labels {
-			delete(ss.Metric, k)
-		}
+	names := make([]string, len(el))
+	for i := range el {
+		names[i] = el[i].Name
 	}
+	return ms, names
 }
 
-// MatrixToIterators returns series iterators for a given matrix.
-func MatrixToIterators(m model.Matrix, err error) ([]local.SeriesIterator, error) {
-	if err != nil {
-		return nil, err
-	}
-
-	its := make([]local.SeriesIterator, 0, len(m))
-	for _, ss := range m {
-		its = append(its, sampleStreamIterator{
-			ss: ss,
-		})
-	}
-	return its, nil
+// LabelValues implements storage.Querier and is a noop.
+func (q *querier) LabelValues(context.Context, string, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	// TODO: Implement: https://github.com/prometheus/prometheus/issues/3351
+	return nil, nil, errors.New("not implemented")
 }
 
-func (q *querier) MetricsForLabelMatchers(ctx context.Context, from, through model.Time, matcherSets ...metric.LabelMatchers) ([]metric.Metric, error) {
-	// TODO: Implement remote metadata querying.
-	return nil, nil
+// LabelNames implements storage.Querier and is a noop.
+func (q *querier) LabelNames(context.Context, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	// TODO: Implement: https://github.com/prometheus/prometheus/issues/3351
+	return nil, nil, errors.New("not implemented")
 }
 
-func (q *querier) LastSampleForLabelMatchers(ctx context.Context, cutoff model.Time, matcherSets ...metric.LabelMatchers) (model.Vector, error) {
-	// TODO: Implement remote last sample querying.
-	return nil, nil
-}
-
-func (q *querier) LabelValuesForLabelName(ctx context.Context, ln model.LabelName) (model.LabelValues, error) {
-	// TODO: Implement remote metadata querying.
-	return nil, nil
-}
-
+// Close implements storage.Querier and is a noop.
 func (q *querier) Close() error {
 	return nil
+}
+
+// chunkQuerier is an adapter to make a client usable as a storage.ChunkQuerier.
+type chunkQuerier struct {
+	querier
+}
+
+// Select implements storage.ChunkQuerier and uses the given matchers to read chunk series sets from the client.
+// It uses remote.querier.Select so it supports external labels and required matchers if specified.
+func (q *chunkQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.ChunkSeriesSet {
+	// TODO(bwplotka) Support remote read chunked and allow returning chunks directly (TODO ticket).
+	return storage.NewSeriesSetToChunkSet(q.querier.Select(ctx, sortSeries, hints, matchers...))
+}
+
+// Note strings in toFilter must be sorted.
+func newSeriesSetFilter(ss storage.SeriesSet, toFilter []string) storage.SeriesSet {
+	return &seriesSetFilter{
+		SeriesSet: ss,
+		toFilter:  toFilter,
+	}
+}
+
+type seriesSetFilter struct {
+	storage.SeriesSet
+	toFilter []string // Label names to remove from result
+	querier  storage.Querier
+}
+
+func (ssf *seriesSetFilter) GetQuerier() storage.Querier {
+	return ssf.querier
+}
+
+func (ssf *seriesSetFilter) SetQuerier(querier storage.Querier) {
+	ssf.querier = querier
+}
+
+func (ssf seriesSetFilter) At() storage.Series {
+	return seriesFilter{
+		Series:   ssf.SeriesSet.At(),
+		toFilter: ssf.toFilter,
+	}
+}
+
+type seriesFilter struct {
+	storage.Series
+	toFilter []string // Label names to remove from result
+}
+
+func (sf seriesFilter) Labels() labels.Labels {
+	b := labels.NewBuilder(sf.Series.Labels())
+	// todo: check if this is too inefficient.
+	b.Del(sf.toFilter...)
+	return b.Labels()
 }

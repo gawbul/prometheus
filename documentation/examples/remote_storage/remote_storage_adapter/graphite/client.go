@@ -16,17 +16,20 @@ package graphite
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"sort"
 	"time"
 
-	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 )
 
 // Client allows sending batches of Prometheus samples to Graphite.
 type Client struct {
+	logger *slog.Logger
+
 	address   string
 	transport string
 	timeout   time.Duration
@@ -34,8 +37,12 @@ type Client struct {
 }
 
 // NewClient creates a new Client.
-func NewClient(address string, transport string, timeout time.Duration, prefix string) *Client {
+func NewClient(logger *slog.Logger, address, transport string, timeout time.Duration, prefix string) *Client {
+	if logger == nil {
+		logger = promslog.NewNopLogger()
+	}
 	return &Client{
+		logger:    logger,
 		address:   address,
 		transport: transport,
 		timeout:   timeout,
@@ -86,19 +93,14 @@ func (c *Client) Write(samples model.Samples) error {
 		t := float64(s.Timestamp.UnixNano()) / 1e9
 		v := float64(s.Value)
 		if math.IsNaN(v) || math.IsInf(v, 0) {
-			log.Warnf("cannot send value %f to Graphite,"+
-				"skipping sample %#v", v, s)
+			c.logger.Debug("Cannot send value to Graphite, skipping sample", "value", v, "sample", s)
 			continue
 		}
 		fmt.Fprintf(&buf, "%s %f %f\n", k, v, t)
 	}
 
 	_, err = conn.Write(buf.Bytes())
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 // Name identifies the client as a Graphite client.

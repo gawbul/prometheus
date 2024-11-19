@@ -14,8 +14,14 @@
 package testutil
 
 import (
-	"io/ioutil"
+	"crypto/sha256"
+	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -26,6 +32,9 @@ const (
 
 	// NilCloser is a no-op Closer.
 	NilCloser = nilCloser(true)
+
+	// The number of times that a TemporaryDirectory will retry its removal.
+	temporaryDirectoryRemoveRetries = 2
 )
 
 type (
@@ -63,8 +72,8 @@ type (
 	// the test flags, which we do not want in non-test binaries even if
 	// they make use of these utilities for some reason).
 	T interface {
-		Fatal(args ...interface{})
-		Fatalf(format string, args ...interface{})
+		Errorf(format string, args ...interface{})
+		FailNow()
 	}
 )
 
@@ -84,15 +93,18 @@ func NewCallbackCloser(fn func()) Closer {
 }
 
 func (t temporaryDirectory) Close() {
+	retries := temporaryDirectoryRemoveRetries
 	err := os.RemoveAll(t.path)
-	if err != nil {
+	for err != nil && retries > 0 {
 		switch {
 		case os.IsNotExist(err):
-			return
+			err = nil
 		default:
-			t.tester.Fatal(err)
+			retries--
+			err = os.RemoveAll(t.path)
 		}
 	}
+	require.NoError(t.tester, err)
 }
 
 func (t temporaryDirectory) Path() string {
@@ -107,10 +119,8 @@ func NewTemporaryDirectory(name string, t T) (handler TemporaryDirectory) {
 		err       error
 	)
 
-	directory, err = ioutil.TempDir(defaultDirectory, name)
-	if err != nil {
-		t.Fatal(err)
-	}
+	directory, err = os.MkdirTemp(defaultDirectory, name)
+	require.NoError(t, err)
 
 	handler = temporaryDirectory{
 		path:   directory,
@@ -118,4 +128,38 @@ func NewTemporaryDirectory(name string, t T) (handler TemporaryDirectory) {
 	}
 
 	return
+}
+
+// DirHash returns a hash of all files attributes and their content within a directory.
+func DirHash(t *testing.T, path string) []byte {
+	hash := sha256.New()
+	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+		require.NoError(t, err)
+
+		if info.IsDir() {
+			return nil
+		}
+		f, err := os.Open(path)
+		require.NoError(t, err)
+		defer f.Close()
+
+		_, err = io.Copy(hash, f)
+		require.NoError(t, err)
+
+		_, err = io.WriteString(hash, strconv.Itoa(int(info.Size())))
+		require.NoError(t, err)
+
+		_, err = io.WriteString(hash, info.Name())
+		require.NoError(t, err)
+
+		modTime, err := info.ModTime().GobEncode()
+		require.NoError(t, err)
+
+		_, err = hash.Write(modTime)
+		require.NoError(t, err)
+		return nil
+	})
+	require.NoError(t, err)
+
+	return hash.Sum(nil)
 }

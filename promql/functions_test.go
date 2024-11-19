@@ -11,63 +11,73 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package promql
+package promql_test
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
 
-func BenchmarkHoltWinters4Week5Min(b *testing.B) {
-	input := `
-clear
-load 5m
-    http_requests{path="/foo"}    0+10x8064
+	"github.com/stretchr/testify/require"
 
-eval instant at 4w holt_winters(http_requests[4w], 0.3, 0.3)
-    {path="/foo"} 80640
-`
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/promqltest"
+	"github.com/prometheus/prometheus/util/teststorage"
+)
 
-	bench := NewBenchmark(b, input)
-	bench.Run()
+func TestDeriv(t *testing.T) {
+	// https://github.com/prometheus/prometheus/issues/2674#issuecomment-315439393
+	// This requires more precision than the usual test system offers,
+	// so we test it by hand.
+	storage := teststorage.New(t)
+	defer storage.Close()
+	opts := promql.EngineOpts{
+		Logger:     nil,
+		Reg:        nil,
+		MaxSamples: 10000,
+		Timeout:    10 * time.Second,
+	}
+	engine := promqltest.NewTestEngineWithOpts(t, opts)
 
+	a := storage.Appender(context.Background())
+
+	var start, interval, i int64
+	metric := labels.FromStrings("__name__", "foo")
+	start = 1493712816939
+	interval = 30 * 1000
+	// Introduce some timestamp jitter to test 0 slope case.
+	// https://github.com/prometheus/prometheus/issues/7180
+	for i = 0; i < 15; i++ {
+		jitter := 12 * i % 2
+		a.Append(0, metric, start+interval*i+jitter, 1)
+	}
+
+	require.NoError(t, a.Commit())
+
+	ctx := context.Background()
+	query, err := engine.NewInstantQuery(ctx, storage, nil, "deriv(foo[30m])", timestamp.Time(1493712846939))
+	require.NoError(t, err)
+
+	result := query.Exec(ctx)
+	require.NoError(t, result.Err)
+
+	vec, _ := result.Vector()
+	require.Len(t, vec, 1, "Expected 1 result, got %d", len(vec))
+	require.Equal(t, 0.0, vec[0].F, "Expected 0.0 as value, got %f", vec[0].F)
 }
 
-func BenchmarkHoltWinters1Week5Min(b *testing.B) {
-	input := `
-clear
-load 5m
-    http_requests{path="/foo"}    0+10x2016
+func TestFunctionList(t *testing.T) {
+	// Test that Functions and parser.Functions list the same functions.
+	for i := range promql.FunctionCalls {
+		_, ok := parser.Functions[i]
+		require.True(t, ok, "function %s exists in promql package, but not in parser package", i)
+	}
 
-eval instant at 1w holt_winters(http_requests[1w], 0.3, 0.3)
-    {path="/foo"} 20160
-`
-
-	bench := NewBenchmark(b, input)
-	bench.Run()
-}
-
-func BenchmarkHoltWinters1Day1Min(b *testing.B) {
-	input := `
-clear
-load 1m
-    http_requests{path="/foo"}    0+10x1440
-
-eval instant at 1d holt_winters(http_requests[1d], 0.3, 0.3)
-    {path="/foo"} 14400
-`
-
-	bench := NewBenchmark(b, input)
-	bench.Run()
-}
-
-func BenchmarkChanges1Day1Min(b *testing.B) {
-	input := `
-clear
-load 1m
-    http_requests{path="/foo"}    0+10x1440
-
-eval instant at 1d changes(http_requests[1d])
-    {path="/foo"} 1440
-`
-
-	bench := NewBenchmark(b, input)
-	bench.Run()
+	for i := range parser.Functions {
+		_, ok := promql.FunctionCalls[i]
+		require.True(t, ok, "function %s exists in parser package, but not in promql package", i)
+	}
 }

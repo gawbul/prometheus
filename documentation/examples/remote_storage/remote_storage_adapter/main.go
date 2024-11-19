@@ -15,27 +15,31 @@
 package main
 
 import (
-	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/log"
-	"github.com/prometheus/common/model"
-
 	influx "github.com/influxdata/influxdb/client/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/common/promslog/flag"
 
 	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/graphite"
 	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/influxdb"
 	"github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/opentsdb"
+	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage/remote"
 )
 
@@ -52,6 +56,7 @@ type config struct {
 	remoteTimeout           time.Duration
 	listenAddr              string
 	telemetryPath           string
+	promslogConfig          promslog.Config
 }
 
 var (
@@ -77,9 +82,12 @@ var (
 	)
 	sentBatchDuration = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name:    "sent_batch_duration_seconds",
-			Help:    "Duration of sample batch send calls to the remote storage.",
-			Buckets: prometheus.DefBuckets,
+			Name:                            "sent_batch_duration_seconds",
+			Help:                            "Duration of sample batch send calls to the remote storage.",
+			Buckets:                         prometheus.DefBuckets,
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: 1 * time.Hour,
 		},
 		[]string{"remote"},
 	)
@@ -94,48 +102,57 @@ func init() {
 
 func main() {
 	cfg := parseFlags()
-	http.Handle(cfg.telemetryPath, prometheus.Handler())
+	http.Handle(cfg.telemetryPath, promhttp.Handler())
 
-	writers, readers := buildClients(cfg)
-	serve(cfg.listenAddr, writers, readers)
+	logger := promslog.New(&cfg.promslogConfig)
+
+	writers, readers := buildClients(logger, cfg)
+	if err := serve(logger, cfg.listenAddr, writers, readers); err != nil {
+		logger.Error("Failed to listen", "addr", cfg.listenAddr, "err", err)
+		os.Exit(1)
+	}
 }
 
 func parseFlags() *config {
+	a := kingpin.New(filepath.Base(os.Args[0]), "Remote storage adapter")
+	a.HelpFlag.Short('h')
+
 	cfg := &config{
 		influxdbPassword: os.Getenv("INFLUXDB_PW"),
+		promslogConfig:   promslog.Config{},
 	}
 
-	flag.StringVar(&cfg.graphiteAddress, "graphite-address", "",
-		"The host:port of the Graphite server to send samples to. None, if empty.",
-	)
-	flag.StringVar(&cfg.graphiteTransport, "graphite-transport", "tcp",
-		"Transport protocol to use to communicate with Graphite. 'tcp', if empty.",
-	)
-	flag.StringVar(&cfg.graphitePrefix, "graphite-prefix", "",
-		"The prefix to prepend to all metrics exported to Graphite. None, if empty.",
-	)
-	flag.StringVar(&cfg.opentsdbURL, "opentsdb-url", "",
-		"The URL of the remote OpenTSDB server to send samples to. None, if empty.",
-	)
-	flag.StringVar(&cfg.influxdbURL, "influxdb-url", "",
-		"The URL of the remote InfluxDB server to send samples to. None, if empty.",
-	)
-	flag.StringVar(&cfg.influxdbRetentionPolicy, "influxdb.retention-policy", "autogen",
-		"The InfluxDB retention policy to use.",
-	)
-	flag.StringVar(&cfg.influxdbUsername, "influxdb.username", "",
-		"The username to use when sending samples to InfluxDB. The corresponding password must be provided via the INFLUXDB_PW environment variable.",
-	)
-	flag.StringVar(&cfg.influxdbDatabase, "influxdb.database", "prometheus",
-		"The name of the database to use for storing samples in InfluxDB.",
-	)
-	flag.DurationVar(&cfg.remoteTimeout, "send-timeout", 30*time.Second,
-		"The timeout to use when sending samples to the remote storage.",
-	)
-	flag.StringVar(&cfg.listenAddr, "web.listen-address", ":9201", "Address to listen on for web endpoints.")
-	flag.StringVar(&cfg.telemetryPath, "web.telemetry-path", "/metrics", "Address to listen on for web endpoints.")
+	a.Flag("graphite-address", "The host:port of the Graphite server to send samples to. None, if empty.").
+		Default("").StringVar(&cfg.graphiteAddress)
+	a.Flag("graphite-transport", "Transport protocol to use to communicate with Graphite. 'tcp', if empty.").
+		Default("tcp").StringVar(&cfg.graphiteTransport)
+	a.Flag("graphite-prefix", "The prefix to prepend to all metrics exported to Graphite. None, if empty.").
+		Default("").StringVar(&cfg.graphitePrefix)
+	a.Flag("opentsdb-url", "The URL of the remote OpenTSDB server to send samples to. None, if empty.").
+		Default("").StringVar(&cfg.opentsdbURL)
+	a.Flag("influxdb-url", "The URL of the remote InfluxDB server to send samples to. None, if empty.").
+		Default("").StringVar(&cfg.influxdbURL)
+	a.Flag("influxdb.retention-policy", "The InfluxDB retention policy to use.").
+		Default("autogen").StringVar(&cfg.influxdbRetentionPolicy)
+	a.Flag("influxdb.username", "The username to use when sending samples to InfluxDB. The corresponding password must be provided via the INFLUXDB_PW environment variable.").
+		Default("").StringVar(&cfg.influxdbUsername)
+	a.Flag("influxdb.database", "The name of the database to use for storing samples in InfluxDB.").
+		Default("prometheus").StringVar(&cfg.influxdbDatabase)
+	a.Flag("send-timeout", "The timeout to use when sending samples to the remote storage.").
+		Default("30s").DurationVar(&cfg.remoteTimeout)
+	a.Flag("web.listen-address", "Address to listen on for web endpoints.").
+		Default(":9201").StringVar(&cfg.listenAddr)
+	a.Flag("web.telemetry-path", "Address to listen on for web endpoints.").
+		Default("/metrics").StringVar(&cfg.telemetryPath)
 
-	flag.Parse()
+	flag.AddFlags(a, &cfg.promslogConfig)
+
+	_, err := a.Parse(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, fmt.Errorf("Error parsing commandline arguments: %w", err))
+		a.Usage(os.Args[1:])
+		os.Exit(2)
+	}
 
 	return cfg
 }
@@ -146,27 +163,33 @@ type writer interface {
 }
 
 type reader interface {
-	Read(req *remote.ReadRequest) (*remote.ReadResponse, error)
+	Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
 	Name() string
 }
 
-func buildClients(cfg *config) ([]writer, []reader) {
+func buildClients(logger *slog.Logger, cfg *config) ([]writer, []reader) {
 	var writers []writer
 	var readers []reader
 	if cfg.graphiteAddress != "" {
 		c := graphite.NewClient(
+			logger.With("storage", "Graphite"),
 			cfg.graphiteAddress, cfg.graphiteTransport,
 			cfg.remoteTimeout, cfg.graphitePrefix)
 		writers = append(writers, c)
 	}
 	if cfg.opentsdbURL != "" {
-		c := opentsdb.NewClient(cfg.opentsdbURL, cfg.remoteTimeout)
+		c := opentsdb.NewClient(
+			logger.With("storage", "OpenTSDB"),
+			cfg.opentsdbURL,
+			cfg.remoteTimeout,
+		)
 		writers = append(writers, c)
 	}
 	if cfg.influxdbURL != "" {
 		url, err := url.Parse(cfg.influxdbURL)
 		if err != nil {
-			log.Fatalf("Failed to parse InfluxDB URL %q: %v", cfg.influxdbURL, err)
+			logger.Error("Failed to parse InfluxDB URL", "url", cfg.influxdbURL, "err", err)
+			os.Exit(1)
 		}
 		conf := influx.HTTPConfig{
 			Addr:     url.String(),
@@ -174,36 +197,37 @@ func buildClients(cfg *config) ([]writer, []reader) {
 			Password: cfg.influxdbPassword,
 			Timeout:  cfg.remoteTimeout,
 		}
-		c := influxdb.NewClient(conf, cfg.influxdbDatabase, cfg.influxdbRetentionPolicy)
+		c := influxdb.NewClient(
+			logger.With("storage", "InfluxDB"),
+			conf,
+			cfg.influxdbDatabase,
+			cfg.influxdbRetentionPolicy,
+		)
 		prometheus.MustRegister(c)
 		writers = append(writers, c)
 		readers = append(readers, c)
 	}
+	logger.Info("Starting up...")
 	return writers, readers
 }
 
-func serve(addr string, writers []writer, readers []reader) error {
+func serve(logger *slog.Logger, addr string, writers []writer, readers []reader) error {
 	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
-		reqBuf, err := ioutil.ReadAll(snappy.NewReader(r.Body))
+		req, err := remote.DecodeWriteRequest(r.Body)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			logger.Error("Read error", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		var req remote.WriteRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		samples := protoToSamples(&req)
+		samples := protoToSamples(req)
 		receivedSamples.Add(float64(len(samples)))
 
 		var wg sync.WaitGroup
 		for _, w := range writers {
 			wg.Add(1)
 			go func(rw writer) {
-				sendSamples(rw, samples)
+				sendSamples(logger, rw, samples)
 				wg.Done()
 			}(w)
 		}
@@ -211,14 +235,23 @@ func serve(addr string, writers []writer, readers []reader) error {
 	})
 
 	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
-		reqBuf, err := ioutil.ReadAll(snappy.NewReader(r.Body))
+		compressed, err := io.ReadAll(r.Body)
 		if err != nil {
+			logger.Error("Read error", "err", err.Error())
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		reqBuf, err := snappy.Decode(nil, compressed)
+		if err != nil {
+			logger.Error("Decode error", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		var req remote.ReadRequest
+		var req prompb.ReadRequest
 		if err := proto.Unmarshal(reqBuf, &req); err != nil {
+			logger.Error("Unmarshal error", "err", err.Error())
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -230,10 +263,10 @@ func serve(addr string, writers []writer, readers []reader) error {
 		}
 		reader := readers[0]
 
-		var resp *remote.ReadResponse
+		var resp *prompb.ReadResponse
 		resp, err = reader.Read(&req)
 		if err != nil {
-			log.With("query", req).With("storage", reader.Name()).With("err", err).Warnf("Error executing query")
+			logger.Warn("Error executing query", "query", req, "storage", reader.Name(), "err", err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -245,16 +278,18 @@ func serve(addr string, writers []writer, readers []reader) error {
 		}
 
 		w.Header().Set("Content-Type", "application/x-protobuf")
-		if _, err := snappy.NewWriter(w).Write(data); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		w.Header().Set("Content-Encoding", "snappy")
+
+		compressed = snappy.Encode(nil, data)
+		if _, err := w.Write(compressed); err != nil {
+			logger.Warn("Error writing response", "storage", reader.Name(), "err", err)
 		}
 	})
 
 	return http.ListenAndServe(addr, nil)
 }
 
-func protoToSamples(req *remote.WriteRequest) model.Samples {
+func protoToSamples(req *prompb.WriteRequest) model.Samples {
 	var samples model.Samples
 	for _, ts := range req.Timeseries {
 		metric := make(model.Metric, len(ts.Labels))
@@ -266,19 +301,19 @@ func protoToSamples(req *remote.WriteRequest) model.Samples {
 			samples = append(samples, &model.Sample{
 				Metric:    metric,
 				Value:     model.SampleValue(s.Value),
-				Timestamp: model.Time(s.TimestampMs),
+				Timestamp: model.Time(s.Timestamp),
 			})
 		}
 	}
 	return samples
 }
 
-func sendSamples(w writer, samples model.Samples) {
+func sendSamples(logger *slog.Logger, w writer, samples model.Samples) {
 	begin := time.Now()
 	err := w.Write(samples)
 	duration := time.Since(begin).Seconds()
 	if err != nil {
-		log.With("num_samples", len(samples)).With("storage", w.Name()).With("err", err).Warnf("Error sending samples to remote storage")
+		logger.Warn("Error sending samples to remote storage", "err", err, "storage", w.Name(), "num_samples", len(samples))
 		failedSamples.WithLabelValues(w.Name()).Add(float64(len(samples)))
 	}
 	sentSamples.WithLabelValues(w.Name()).Add(float64(len(samples)))

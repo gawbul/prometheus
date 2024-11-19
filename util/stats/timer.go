@@ -16,7 +16,7 @@ package stats
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -24,7 +24,7 @@ import (
 // was running (the time between Start() and Stop()).
 type Timer struct {
 	name     fmt.Stringer
-	created  time.Time
+	created  int
 	start    time.Time
 	duration time.Duration
 }
@@ -45,6 +45,11 @@ func (t *Timer) ElapsedTime() time.Duration {
 	return time.Since(t.start)
 }
 
+// Duration returns the duration value of the timer in seconds.
+func (t *Timer) Duration() float64 {
+	return t.duration.Seconds()
+}
+
 // Return a string representation of the Timer.
 func (t *Timer) String() string {
 	return fmt.Sprintf("%s: %s", t.name, t.duration)
@@ -53,7 +58,6 @@ func (t *Timer) String() string {
 // A TimerGroup represents a group of timers relevant to a single query.
 type TimerGroup struct {
 	timers map[fmt.Stringer]*Timer
-	child  *TimerGroup
 }
 
 // NewTimerGroup constructs a new TimerGroup.
@@ -68,41 +72,21 @@ func (t *TimerGroup) GetTimer(name fmt.Stringer) *Timer {
 	}
 	timer := &Timer{
 		name:    name,
-		created: time.Now(),
+		created: len(t.timers),
 	}
 	t.timers[name] = timer
 	return timer
 }
 
-// Timers is a slice of Timer pointers that implements Len and Swap from
-// sort.Interface.
-type Timers []*Timer
-
-type byCreationTimeSorter struct{ Timers }
-
-// Len implements sort.Interface.
-func (t Timers) Len() int {
-	return len(t)
-}
-
-// Swap implements sort.Interface.
-func (t Timers) Swap(i, j int) {
-	t[i], t[j] = t[j], t[i]
-}
-
-func (s byCreationTimeSorter) Less(i, j int) bool {
-	return s.Timers[i].created.Before(s.Timers[j].created)
-}
-
 // Return a string representation of a TimerGroup.
 func (t *TimerGroup) String() string {
-	timers := byCreationTimeSorter{}
+	timers := make([]*Timer, 0, len(t.timers))
 	for _, timer := range t.timers {
-		timers.Timers = append(timers.Timers, timer)
+		timers = append(timers, timer)
 	}
-	sort.Sort(timers)
+	slices.SortFunc(timers, func(a, b *Timer) int { return a.created - b.created })
 	result := &bytes.Buffer{}
-	for _, timer := range timers.Timers {
+	for _, timer := range timers {
 		fmt.Fprintf(result, "%s\n", timer)
 	}
 	return result.String()

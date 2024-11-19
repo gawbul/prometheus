@@ -14,369 +14,163 @@
 package rules
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"log/slog"
 	"net/url"
-	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
-	html_template "html/template"
-
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/log"
-	"github.com/prometheus/common/model"
-	"golang.org/x/net/context"
+	"github.com/prometheus/common/promslog"
+	"golang.org/x/sync/semaphore"
 
-	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/storage/local"
 	"github.com/prometheus/prometheus/util/strutil"
 )
 
-// Constants for instrumentation.
-const namespace = "prometheus"
+// QueryFunc processes PromQL queries.
+type QueryFunc func(ctx context.Context, q string, t time.Time) (promql.Vector, error)
 
-var (
-	evalDuration = prometheus.NewSummaryVec(
-		prometheus.SummaryOpts{
-			Namespace: namespace,
-			Name:      "rule_evaluation_duration_seconds",
-			Help:      "The duration for a rule to execute.",
-		},
-		[]string{"rule_type"},
-	)
-	evalFailures = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "rule_evaluation_failures_total",
-			Help:      "The total number of rule evaluation failures.",
-		},
-		[]string{"rule_type"},
-	)
-	evalTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: namespace,
-			Name:      "rule_evaluations_total",
-			Help:      "The total number of rule evaluations.",
-		},
-		[]string{"rule_type"},
-	)
-	iterationDuration = prometheus.NewSummary(prometheus.SummaryOpts{
-		Namespace:  namespace,
-		Name:       "evaluator_duration_seconds",
-		Help:       "The duration of rule group evaluations.",
-		Objectives: map[float64]float64{0.01: 0.001, 0.05: 0.005, 0.5: 0.05, 0.90: 0.01, 0.99: 0.001},
-	})
-	iterationsSkipped = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Name:      "evaluator_iterations_skipped_total",
-		Help:      "The total number of rule group evaluations skipped due to throttled metric storage.",
-	})
-	iterationsMissed = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Name:      "evaluator_iterations_missed_total",
-		Help:      "The total number of rule group evaluations missed due to slow rule group evaluation.",
-	})
-	iterationsScheduled = prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: namespace,
-		Name:      "evaluator_iterations_total",
-		Help:      "The total number of scheduled rule group evaluations, whether executed, missed or skipped.",
-	})
-)
-
-func init() {
-	evalTotal.WithLabelValues(string(ruleTypeAlert))
-	evalTotal.WithLabelValues(string(ruleTypeRecording))
-	evalFailures.WithLabelValues(string(ruleTypeAlert))
-	evalFailures.WithLabelValues(string(ruleTypeRecording))
-
-	prometheus.MustRegister(iterationDuration)
-	prometheus.MustRegister(iterationsScheduled)
-	prometheus.MustRegister(iterationsSkipped)
-	prometheus.MustRegister(iterationsMissed)
-	prometheus.MustRegister(evalFailures)
-	prometheus.MustRegister(evalDuration)
-}
-
-type ruleType string
-
-const (
-	ruleTypeAlert     = "alerting"
-	ruleTypeRecording = "recording"
-)
-
-// A Rule encapsulates a vector expression which is evaluated at a specified
-// interval and acted upon (currently either recorded or used for alerting).
-type Rule interface {
-	Name() string
-	// eval evaluates the rule, including any associated recording or alerting actions.
-	Eval(context.Context, model.Time, *promql.Engine, string) (model.Vector, error)
-	// String returns a human-readable string representation of the rule.
-	String() string
-	// HTMLSnippet returns a human-readable string representation of the rule,
-	// decorated with HTML elements for use the web frontend.
-	HTMLSnippet(pathPrefix string) html_template.HTML
-}
-
-// Group is a set of rules that have a logical relation.
-type Group struct {
-	name     string
-	interval time.Duration
-	rules    []Rule
-	opts     *ManagerOptions
-
-	done       chan struct{}
-	terminated chan struct{}
-}
-
-// NewGroup makes a new Group with the given name, options, and rules.
-func NewGroup(name string, interval time.Duration, rules []Rule, opts *ManagerOptions) *Group {
-	return &Group{
-		name:       name,
-		interval:   interval,
-		rules:      rules,
-		opts:       opts,
-		done:       make(chan struct{}),
-		terminated: make(chan struct{}),
-	}
-}
-
-func (g *Group) run() {
-	defer close(g.terminated)
-
-	// Wait an initial amount to have consistently slotted intervals.
-	select {
-	case <-time.After(g.offset()):
-	case <-g.done:
-		return
-	}
-
-	iter := func() {
-		iterationsScheduled.Inc()
-		if g.opts.SampleAppender.NeedsThrottling() {
-			iterationsSkipped.Inc()
-			return
+// EngineQueryFunc returns a new query function that executes instant queries against
+// the given engine.
+// It converts scalar into vector results.
+func EngineQueryFunc(engine promql.QueryEngine, q storage.Queryable) QueryFunc {
+	return func(ctx context.Context, qs string, t time.Time) (promql.Vector, error) {
+		q, err := engine.NewInstantQuery(ctx, q, nil, qs, t)
+		if err != nil {
+			return nil, err
 		}
-		start := time.Now()
-		g.Eval()
-
-		iterationDuration.Observe(time.Since(start).Seconds())
-	}
-	lastTriggered := time.Now()
-	iter()
-
-	tick := time.NewTicker(g.interval)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-g.done:
-			return
+		res := q.Exec(ctx)
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		switch v := res.Value.(type) {
+		case promql.Vector:
+			return v, nil
+		case promql.Scalar:
+			return promql.Vector{promql.Sample{
+				T:      v.T,
+				F:      v.V,
+				Metric: labels.Labels{},
+			}}, nil
 		default:
-			select {
-			case <-g.done:
-				return
-			case <-tick.C:
-				missed := (time.Since(lastTriggered).Nanoseconds() / g.interval.Nanoseconds()) - 1
-				if missed > 0 {
-					iterationsMissed.Add(float64(missed))
-					iterationsScheduled.Add(float64(missed))
-				}
-				lastTriggered = time.Now()
-				iter()
-			}
+			return nil, errors.New("rule result is not a vector or scalar")
 		}
 	}
 }
 
-func (g *Group) stop() {
-	close(g.done)
-	<-g.terminated
-}
+// DefaultEvalIterationFunc is the default implementation of
+// GroupEvalIterationFunc that is periodically invoked to evaluate the rules
+// in a group at a given point in time and updates Group state and metrics
+// accordingly. Custom GroupEvalIterationFunc implementations are recommended
+// to invoke this function as well, to ensure correct Group state and metrics
+// are maintained.
+func DefaultEvalIterationFunc(ctx context.Context, g *Group, evalTimestamp time.Time) {
+	g.metrics.IterationsScheduled.WithLabelValues(GroupKey(g.file, g.name)).Inc()
 
-func (g *Group) fingerprint() model.Fingerprint {
-	l := model.LabelSet{"name": model.LabelValue(g.name)}
-	return l.Fingerprint()
-}
+	start := time.Now()
+	g.Eval(ctx, evalTimestamp)
+	timeSinceStart := time.Since(start)
 
-// offset returns until the next consistently slotted evaluation interval.
-func (g *Group) offset() time.Duration {
-	now := time.Now().UnixNano()
-
-	var (
-		base   = now - (now % int64(g.interval))
-		offset = uint64(g.fingerprint()) % uint64(g.interval)
-		next   = base + int64(offset)
-	)
-
-	if next < now {
-		next += int64(g.interval)
-	}
-	return time.Duration(next - now)
-}
-
-// copyState copies the alerting rule state from the given group.
-func (g *Group) copyState(from *Group) {
-	for _, fromRule := range from.rules {
-		far, ok := fromRule.(*AlertingRule)
-		if !ok {
-			continue
-		}
-		for _, rule := range g.rules {
-			ar, ok := rule.(*AlertingRule)
-			if !ok {
-				continue
-			}
-			// TODO(fabxc): forbid same alert definitions that are not unique by
-			// at least on static label or alertname?
-			if far.equal(ar) {
-				for fp, a := range far.active {
-					ar.active[fp] = a
-				}
-			}
-		}
-	}
-}
-
-func typeForRule(r Rule) ruleType {
-	switch r.(type) {
-	case *AlertingRule:
-		return ruleTypeAlert
-	case *RecordingRule:
-		return ruleTypeRecording
-	}
-	panic(fmt.Errorf("unknown rule type: %T", r))
-}
-
-// Eval runs a single evaluation cycle in which all rules are evaluated in parallel.
-// In the future a single group will be evaluated sequentially to properly handle
-// rule dependency.
-func (g *Group) Eval() {
-	var (
-		now = model.Now()
-		wg  sync.WaitGroup
-	)
-
-	for _, rule := range g.rules {
-		rtyp := string(typeForRule(rule))
-
-		wg.Add(1)
-		// BUG(julius): Look at fixing thundering herd.
-		go func(rule Rule) {
-			defer wg.Done()
-
-			defer func(t time.Time) {
-				evalDuration.WithLabelValues(rtyp).Observe(time.Since(t).Seconds())
-			}(time.Now())
-
-			evalTotal.WithLabelValues(rtyp).Inc()
-
-			vector, err := rule.Eval(g.opts.Context, now, g.opts.QueryEngine, g.opts.ExternalURL.Path)
-			if err != nil {
-				// Canceled queries are intentional termination of queries. This normally
-				// happens on shutdown and thus we skip logging of any errors here.
-				if _, ok := err.(promql.ErrQueryCanceled); !ok {
-					log.Warnf("Error while evaluating rule %q: %s", rule, err)
-				}
-				evalFailures.WithLabelValues(rtyp).Inc()
-				return
-			}
-
-			if ar, ok := rule.(*AlertingRule); ok {
-				g.sendAlerts(ar, now)
-			}
-			var (
-				numOutOfOrder = 0
-				numDuplicates = 0
-			)
-			for _, s := range vector {
-				if err := g.opts.SampleAppender.Append(s); err != nil {
-					switch err {
-					case local.ErrOutOfOrderSample:
-						numOutOfOrder++
-						log.With("sample", s).With("error", err).Debug("Rule evaluation result discarded")
-					case local.ErrDuplicateSampleForTimestamp:
-						numDuplicates++
-						log.With("sample", s).With("error", err).Debug("Rule evaluation result discarded")
-					default:
-						log.With("sample", s).With("error", err).Warn("Rule evaluation result discarded")
-					}
-				}
-			}
-			if numOutOfOrder > 0 {
-				log.With("numDropped", numOutOfOrder).Warn("Error on ingesting out-of-order result from rule evaluation")
-			}
-			if numDuplicates > 0 {
-				log.With("numDropped", numDuplicates).Warn("Error on ingesting results from rule evaluation with different value but same timestamp")
-			}
-		}(rule)
-	}
-	wg.Wait()
-}
-
-// sendAlerts sends alert notifications for the given rule.
-func (g *Group) sendAlerts(rule *AlertingRule, timestamp model.Time) error {
-	var alerts model.Alerts
-
-	for _, alert := range rule.currentAlerts() {
-		// Only send actually firing alerts.
-		if alert.State == StatePending {
-			continue
-		}
-
-		a := &model.Alert{
-			StartsAt:     alert.ActiveAt.Add(rule.holdDuration).Time(),
-			Labels:       alert.Labels,
-			Annotations:  alert.Annotations,
-			GeneratorURL: g.opts.ExternalURL.String() + strutil.GraphLinkForExpression(rule.vector.String()),
-		}
-		if alert.ResolvedAt != 0 {
-			a.EndsAt = alert.ResolvedAt.Time()
-		}
-
-		alerts = append(alerts, a)
-	}
-
-	if len(alerts) > 0 {
-		g.opts.Notifier.Send(alerts...)
-	}
-
-	return nil
+	g.metrics.IterationDuration.Observe(timeSinceStart.Seconds())
+	g.setEvaluationTime(timeSinceStart)
+	g.setLastEvaluation(start)
+	g.setLastEvalTimestamp(evalTimestamp)
 }
 
 // The Manager manages recording and alerting rules.
 type Manager struct {
-	opts   *ManagerOptions
-	groups map[string]*Group
-	mtx    sync.RWMutex
-	block  chan struct{}
+	opts     *ManagerOptions
+	groups   map[string]*Group
+	mtx      sync.RWMutex
+	block    chan struct{}
+	done     chan struct{}
+	restored bool
+
+	logger *slog.Logger
 }
+
+// NotifyFunc sends notifications about a set of alerts generated by the given expression.
+type NotifyFunc func(ctx context.Context, expr string, alerts ...*Alert)
 
 // ManagerOptions bundles options for the Manager.
 type ManagerOptions struct {
-	ExternalURL    *url.URL
-	QueryEngine    *promql.Engine
-	Context        context.Context
-	Notifier       *notifier.Notifier
-	SampleAppender storage.SampleAppender
+	ExternalURL               *url.URL
+	QueryFunc                 QueryFunc
+	NotifyFunc                NotifyFunc
+	Context                   context.Context
+	Appendable                storage.Appendable
+	Queryable                 storage.Queryable
+	Logger                    *slog.Logger
+	Registerer                prometheus.Registerer
+	OutageTolerance           time.Duration
+	ForGracePeriod            time.Duration
+	ResendDelay               time.Duration
+	GroupLoader               GroupLoader
+	DefaultRuleQueryOffset    func() time.Duration
+	MaxConcurrentEvals        int64
+	ConcurrentEvalsEnabled    bool
+	RuleConcurrencyController RuleConcurrencyController
+	RuleDependencyController  RuleDependencyController
+
+	Metrics *Metrics
 }
 
 // NewManager returns an implementation of Manager, ready to be started
 // by calling the Run method.
 func NewManager(o *ManagerOptions) *Manager {
-	manager := &Manager{
+	if o.Metrics == nil {
+		o.Metrics = NewGroupMetrics(o.Registerer)
+	}
+
+	if o.GroupLoader == nil {
+		o.GroupLoader = FileLoader{}
+	}
+
+	if o.RuleConcurrencyController == nil {
+		if o.ConcurrentEvalsEnabled {
+			o.RuleConcurrencyController = newRuleConcurrencyController(o.MaxConcurrentEvals)
+		} else {
+			o.RuleConcurrencyController = sequentialRuleEvalController{}
+		}
+	}
+
+	if o.RuleDependencyController == nil {
+		o.RuleDependencyController = ruleDependencyController{}
+	}
+
+	if o.Logger == nil {
+		o.Logger = promslog.NewNopLogger()
+	}
+
+	m := &Manager{
 		groups: map[string]*Group{},
 		opts:   o,
 		block:  make(chan struct{}),
+		done:   make(chan struct{}),
+		logger: o.Logger,
 	}
-	return manager
+
+	return m
 }
 
-// Run starts processing of the rule manager.
+// Run starts processing of the rule manager. It is blocking.
 func (m *Manager) Run() {
+	m.logger.Info("Starting rule manager...")
+	m.start()
+	<-m.done
+}
+
+func (m *Manager) start() {
 	close(m.block)
 }
 
@@ -385,67 +179,92 @@ func (m *Manager) Stop() {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
-	log.Info("Stopping rule manager...")
+	m.logger.Info("Stopping rule manager...")
 
 	for _, eg := range m.groups {
 		eg.stop()
 	}
 
-	log.Info("Rule manager stopped.")
+	// Shut down the groups waiting multiple evaluation intervals to write
+	// staleness markers.
+	close(m.done)
+
+	m.logger.Info("Rule manager stopped")
 }
 
-// ApplyConfig updates the rule manager's state as the config requires. If
+// Update the rule manager's state as the config requires. If
 // loading the new rules failed the old rule set is restored.
-func (m *Manager) ApplyConfig(conf *config.Config) error {
+// This method will no-op in case the manager is already stopped.
+func (m *Manager) Update(interval time.Duration, files []string, externalLabels labels.Labels, externalURL string, groupEvalIterationFunc GroupEvalIterationFunc) error {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
-	// Get all rule files and load the groups they define.
-	var files []string
-	for _, pat := range conf.RuleFiles {
-		fs, err := filepath.Glob(pat)
-		if err != nil {
-			// The only error can be a bad pattern.
-			return fmt.Errorf("error retrieving rule files for %s: %s", pat, err)
-		}
-		files = append(files, fs...)
+	// We cannot update a stopped manager
+	select {
+	case <-m.done:
+		return nil
+	default:
 	}
 
-	// To be replaced with a configurable per-group interval.
-	groups, err := m.loadGroups(time.Duration(conf.GlobalConfig.EvaluationInterval), files...)
-	if err != nil {
-		return fmt.Errorf("error loading rules, previous rule set restored: %s", err)
+	groups, errs := m.LoadGroups(interval, externalLabels, externalURL, groupEvalIterationFunc, files...)
+
+	if errs != nil {
+		for _, e := range errs {
+			m.logger.Error("loading groups failed", "err", e)
+		}
+		return errors.New("error loading rules, previous rule set restored")
 	}
+	m.restored = true
 
 	var wg sync.WaitGroup
-
 	for _, newg := range groups {
+		// If there is an old group with the same identifier,
+		// check if new group equals with the old group, if yes then skip it.
+		// If not equals, stop it and wait for it to finish the current iteration.
+		// Then copy it into the new group.
+		gn := GroupKey(newg.file, newg.name)
+		oldg, ok := m.groups[gn]
+		delete(m.groups, gn)
+
+		if ok && oldg.Equals(newg) {
+			groups[gn] = oldg
+			continue
+		}
+
 		wg.Add(1)
-
-		// If there is an old group with the same identifier, stop it and wait for
-		// it to finish the current iteration. Then copy its into the new group.
-		oldg, ok := m.groups[newg.name]
-		delete(m.groups, newg.name)
-
 		go func(newg *Group) {
 			if ok {
 				oldg.stop()
-				newg.copyState(oldg)
+				newg.CopyState(oldg)
 			}
-			go func() {
-				// Wait with starting evaluation until the rule manager
-				// is told to run. This is necessary to avoid running
-				// queries against a bootstrapping storage.
-				<-m.block
-				newg.run()
-			}()
 			wg.Done()
+			// Wait with starting evaluation until the rule manager
+			// is told to run. This is necessary to avoid running
+			// queries against a bootstrapping storage.
+			<-m.block
+			newg.run(m.opts.Context)
 		}(newg)
 	}
 
 	// Stop remaining old groups.
-	for _, oldg := range m.groups {
-		oldg.stop()
+	wg.Add(len(m.groups))
+	for n, oldg := range m.groups {
+		go func(n string, g *Group) {
+			g.markStale = true
+			g.stop()
+			if m := g.metrics; m != nil {
+				m.IterationsMissed.DeleteLabelValues(n)
+				m.IterationsScheduled.DeleteLabelValues(n)
+				m.EvalTotal.DeleteLabelValues(n)
+				m.EvalFailures.DeleteLabelValues(n)
+				m.GroupInterval.DeleteLabelValues(n)
+				m.GroupLastEvalTime.DeleteLabelValues(n)
+				m.GroupLastDuration.DeleteLabelValues(n)
+				m.GroupRules.DeleteLabelValues(n)
+				m.GroupSamples.DeleteLabelValues((n))
+			}
+			wg.Done()
+		}(n, oldg)
 	}
 
 	wg.Wait()
@@ -454,53 +273,126 @@ func (m *Manager) ApplyConfig(conf *config.Config) error {
 	return nil
 }
 
-// loadGroups reads groups from a list of files.
-// As there's currently no group syntax a single group named "default" containing
-// all rules will be returned.
-func (m *Manager) loadGroups(interval time.Duration, filenames ...string) (map[string]*Group, error) {
-	rules := []Rule{}
+// GroupLoader is responsible for loading rule groups from arbitrary sources and parsing them.
+type GroupLoader interface {
+	Load(identifier string) (*rulefmt.RuleGroups, []error)
+	Parse(query string) (parser.Expr, error)
+}
+
+// FileLoader is the default GroupLoader implementation. It defers to rulefmt.ParseFile
+// and parser.ParseExpr.
+type FileLoader struct{}
+
+func (FileLoader) Load(identifier string) (*rulefmt.RuleGroups, []error) {
+	return rulefmt.ParseFile(identifier)
+}
+
+func (FileLoader) Parse(query string) (parser.Expr, error) { return parser.ParseExpr(query) }
+
+// LoadGroups reads groups from a list of files.
+func (m *Manager) LoadGroups(
+	interval time.Duration, externalLabels labels.Labels, externalURL string, groupEvalIterationFunc GroupEvalIterationFunc, filenames ...string,
+) (map[string]*Group, []error) {
+	groups := make(map[string]*Group)
+
+	shouldRestore := !m.restored
+
 	for _, fn := range filenames {
-		content, err := ioutil.ReadFile(fn)
-		if err != nil {
-			return nil, err
-		}
-		stmts, err := promql.ParseStmts(string(content))
-		if err != nil {
-			return nil, fmt.Errorf("error parsing %s: %s", fn, err)
+		rgs, errs := m.opts.GroupLoader.Load(fn)
+		if errs != nil {
+			return nil, errs
 		}
 
-		for _, stmt := range stmts {
-			var rule Rule
-
-			switch r := stmt.(type) {
-			case *promql.AlertStmt:
-				rule = NewAlertingRule(r.Name, r.Expr, r.Duration, r.Labels, r.Annotations)
-
-			case *promql.RecordStmt:
-				rule = NewRecordingRule(r.Name, r.Expr, r.Labels)
-
-			default:
-				panic("retrieval.Manager.LoadRuleFiles: unknown statement type")
+		for _, rg := range rgs.Groups {
+			itv := interval
+			if rg.Interval != 0 {
+				itv = time.Duration(rg.Interval)
 			}
-			rules = append(rules, rule)
+
+			rules := make([]Rule, 0, len(rg.Rules))
+			for _, r := range rg.Rules {
+				expr, err := m.opts.GroupLoader.Parse(r.Expr.Value)
+				if err != nil {
+					return nil, []error{fmt.Errorf("%s: %w", fn, err)}
+				}
+
+				mLabels := FromMaps(rg.Labels, r.Labels)
+
+				if r.Alert.Value != "" {
+					rules = append(rules, NewAlertingRule(
+						r.Alert.Value,
+						expr,
+						time.Duration(r.For),
+						time.Duration(r.KeepFiringFor),
+						mLabels,
+						labels.FromMap(r.Annotations),
+						externalLabels,
+						externalURL,
+						m.restored,
+						m.logger.With("alert", r.Alert),
+					))
+					continue
+				}
+				rules = append(rules, NewRecordingRule(
+					r.Record.Value,
+					expr,
+					mLabels,
+				))
+			}
+
+			// Check dependencies between rules and store it on the Rule itself.
+			m.opts.RuleDependencyController.AnalyseRules(rules)
+
+			groups[GroupKey(fn, rg.Name)] = NewGroup(GroupOptions{
+				Name:              rg.Name,
+				File:              fn,
+				Interval:          itv,
+				Limit:             rg.Limit,
+				Rules:             rules,
+				ShouldRestore:     shouldRestore,
+				Opts:              m.opts,
+				QueryOffset:       (*time.Duration)(rg.QueryOffset),
+				done:              m.done,
+				EvalIterationFunc: groupEvalIterationFunc,
+			})
 		}
 	}
 
-	// Currently there is no group syntax implemented. Thus all rules
-	// are read into a single default group.
-	g := NewGroup("default", interval, rules, m.opts)
-	groups := map[string]*Group{g.name: g}
 	return groups, nil
 }
 
+// RuleGroups returns the list of manager's rule groups.
+func (m *Manager) RuleGroups() []*Group {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	rgs := make([]*Group, 0, len(m.groups))
+	for _, g := range m.groups {
+		rgs = append(rgs, g)
+	}
+
+	slices.SortFunc(rgs, func(a, b *Group) int {
+		fileCompare := strings.Compare(a.file, b.file)
+
+		// If its 0, then the file names are the same.
+		// Lets look at the group names in that case.
+		if fileCompare != 0 {
+			return fileCompare
+		}
+		return strings.Compare(a.name, b.name)
+	})
+
+	return rgs
+}
+
 // Rules returns the list of the manager's rules.
-func (m *Manager) Rules() []Rule {
+func (m *Manager) Rules(matcherSets ...[]*labels.Matcher) []Rule {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 
 	var rules []Rule
 	for _, g := range m.groups {
-		rules = append(rules, g.rules...)
+		rules = append(rules, g.Rules(matcherSets...)...)
 	}
 
 	return rules
@@ -508,14 +400,123 @@ func (m *Manager) Rules() []Rule {
 
 // AlertingRules returns the list of the manager's alerting rules.
 func (m *Manager) AlertingRules() []*AlertingRule {
-	m.mtx.RLock()
-	defer m.mtx.RUnlock()
-
 	alerts := []*AlertingRule{}
 	for _, rule := range m.Rules() {
 		if alertingRule, ok := rule.(*AlertingRule); ok {
 			alerts = append(alerts, alertingRule)
 		}
 	}
+
 	return alerts
+}
+
+type Sender interface {
+	Send(alerts ...*notifier.Alert)
+}
+
+// SendAlerts implements the rules.NotifyFunc for a Notifier.
+func SendAlerts(s Sender, externalURL string) NotifyFunc {
+	return func(ctx context.Context, expr string, alerts ...*Alert) {
+		var res []*notifier.Alert
+
+		for _, alert := range alerts {
+			a := &notifier.Alert{
+				StartsAt:     alert.FiredAt,
+				Labels:       alert.Labels,
+				Annotations:  alert.Annotations,
+				GeneratorURL: externalURL + strutil.TableLinkForExpression(expr),
+			}
+			if !alert.ResolvedAt.IsZero() {
+				a.EndsAt = alert.ResolvedAt
+			} else {
+				a.EndsAt = alert.ValidUntil
+			}
+			res = append(res, a)
+		}
+
+		if len(alerts) > 0 {
+			s.Send(res...)
+		}
+	}
+}
+
+// RuleDependencyController controls whether a set of rules have dependencies between each other.
+type RuleDependencyController interface {
+	// AnalyseRules analyses dependencies between the input rules. For each rule that it's guaranteed
+	// not having any dependants and/or dependency, this function should call Rule.SetNoDependentRules(true)
+	// and/or Rule.SetNoDependencyRules(true).
+	AnalyseRules(rules []Rule)
+}
+
+type ruleDependencyController struct{}
+
+// AnalyseRules implements RuleDependencyController.
+func (c ruleDependencyController) AnalyseRules(rules []Rule) {
+	depMap := buildDependencyMap(rules)
+	for _, r := range rules {
+		r.SetNoDependentRules(depMap.dependents(r) == 0)
+		r.SetNoDependencyRules(depMap.dependencies(r) == 0)
+	}
+}
+
+// RuleConcurrencyController controls concurrency for rules that are safe to be evaluated concurrently.
+// Its purpose is to bound the amount of concurrency in rule evaluations to avoid overwhelming the Prometheus
+// server with additional query load. Concurrency is controlled globally, not on a per-group basis.
+type RuleConcurrencyController interface {
+	// Allow determines if the given rule is allowed to be evaluated concurrently.
+	// If Allow() returns true, then Done() must be called to release the acquired slot and corresponding cleanup is done.
+	// It is important that both *Group and Rule are not retained and only be used for the duration of the call.
+	Allow(ctx context.Context, group *Group, rule Rule) bool
+
+	// Done releases a concurrent evaluation slot.
+	Done(ctx context.Context)
+}
+
+// concurrentRuleEvalController holds a weighted semaphore which controls the concurrent evaluation of rules.
+type concurrentRuleEvalController struct {
+	sema *semaphore.Weighted
+}
+
+func newRuleConcurrencyController(maxConcurrency int64) RuleConcurrencyController {
+	return &concurrentRuleEvalController{
+		sema: semaphore.NewWeighted(maxConcurrency),
+	}
+}
+
+func (c *concurrentRuleEvalController) Allow(_ context.Context, _ *Group, rule Rule) bool {
+	// To allow a rule to be executed concurrently, we need 3 conditions:
+	// 1. The rule must not have any rules that depend on it.
+	// 2. The rule itself must not depend on any other rules.
+	// 3. If 1 & 2 are true, then and only then we should try to acquire the concurrency slot.
+	if rule.NoDependentRules() && rule.NoDependencyRules() {
+		return c.sema.TryAcquire(1)
+	}
+
+	return false
+}
+
+func (c *concurrentRuleEvalController) Done(_ context.Context) {
+	c.sema.Release(1)
+}
+
+// sequentialRuleEvalController is a RuleConcurrencyController that runs every rule sequentially.
+type sequentialRuleEvalController struct{}
+
+func (c sequentialRuleEvalController) Allow(_ context.Context, _ *Group, _ Rule) bool {
+	return false
+}
+
+func (c sequentialRuleEvalController) Done(_ context.Context) {}
+
+// FromMaps returns new sorted Labels from the given maps, overriding each other in order.
+func FromMaps(maps ...map[string]string) labels.Labels {
+	mLables := make(map[string]string)
+
+	for _, m := range maps {
+		for k, v := range m {
+			mLables[k] = v
+		}
+	}
+
+	return labels.FromMap(mLables)
 }

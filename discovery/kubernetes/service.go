@@ -14,149 +14,189 @@
 package kubernetes
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 
-	"github.com/prometheus/common/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/util/strutil"
-	"golang.org/x/net/context"
-	apiv1 "k8s.io/client-go/1.5/pkg/api/v1"
-	"k8s.io/client-go/1.5/tools/cache"
+	"github.com/prometheus/common/promslog"
+	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
 // Service implements discovery of Kubernetes services.
 type Service struct {
-	logger   log.Logger
+	logger   *slog.Logger
 	informer cache.SharedInformer
 	store    cache.Store
+	queue    *workqueue.Type
 }
 
 // NewService returns a new service discovery.
-func NewService(l log.Logger, inf cache.SharedInformer) *Service {
-	return &Service{logger: l, informer: inf, store: inf.GetStore()}
-}
-
-// Run implements the TargetProvider interface.
-func (s *Service) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
-	// Send full initial set of pod targets.
-	var initial []*config.TargetGroup
-	for _, o := range s.store.List() {
-		tg := s.buildService(o.(*apiv1.Service))
-		initial = append(initial, tg)
-	}
-	select {
-	case <-ctx.Done():
-		return
-	case ch <- initial:
+func NewService(l *slog.Logger, inf cache.SharedInformer, eventCount *prometheus.CounterVec) *Service {
+	if l == nil {
+		l = promslog.NewNopLogger()
 	}
 
-	// Send target groups for service updates.
-	send := func(tg *config.TargetGroup) {
-		select {
-		case <-ctx.Done():
-		case ch <- []*config.TargetGroup{tg}:
-		}
+	svcAddCount := eventCount.WithLabelValues(RoleService.String(), MetricLabelRoleAdd)
+	svcUpdateCount := eventCount.WithLabelValues(RoleService.String(), MetricLabelRoleUpdate)
+	svcDeleteCount := eventCount.WithLabelValues(RoleService.String(), MetricLabelRoleDelete)
+
+	s := &Service{
+		logger:   l,
+		informer: inf,
+		store:    inf.GetStore(),
+		queue:    workqueue.NewNamed(RoleService.String()),
 	}
-	s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+
+	_, err := s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(o interface{}) {
-			eventCount.WithLabelValues("service", "add").Inc()
-
-			svc, err := convertToService(o)
-			if err != nil {
-				s.logger.With("err", err).Errorln("converting to Service object failed")
-				return
-			}
-			send(s.buildService(svc))
+			svcAddCount.Inc()
+			s.enqueue(o)
 		},
 		DeleteFunc: func(o interface{}) {
-			eventCount.WithLabelValues("service", "delete").Inc()
-
-			svc, err := convertToService(o)
-			if err != nil {
-				s.logger.With("err", err).Errorln("converting to Service object failed")
-				return
-			}
-			send(&config.TargetGroup{Source: serviceSource(svc)})
+			svcDeleteCount.Inc()
+			s.enqueue(o)
 		},
 		UpdateFunc: func(_, o interface{}) {
-			eventCount.WithLabelValues("service", "update").Inc()
-
-			svc, err := convertToService(o)
-			if err != nil {
-				s.logger.With("err", err).Errorln("converting to Service object failed")
-				return
-			}
-			send(s.buildService(svc))
+			svcUpdateCount.Inc()
+			s.enqueue(o)
 		},
 	})
+	if err != nil {
+		l.Error("Error adding services event handler.", "err", err)
+	}
+	return s
+}
+
+func (s *Service) enqueue(obj interface{}) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		return
+	}
+
+	s.queue.Add(key)
+}
+
+// Run implements the Discoverer interface.
+func (s *Service) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
+	defer s.queue.ShutDown()
+
+	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			s.logger.Error("service informer unable to sync cache")
+		}
+		return
+	}
+
+	go func() {
+		for s.process(ctx, ch) {
+		}
+	}()
 
 	// Block until the target provider is explicitly canceled.
 	<-ctx.Done()
 }
 
-func convertToService(o interface{}) (*apiv1.Service, error) {
-	service, isService := o.(*apiv1.Service)
-	if !isService {
-		deletedState, ok := o.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			return nil, fmt.Errorf("Received unexpected object: %v", o)
-		}
-		service, ok = deletedState.Obj.(*apiv1.Service)
-		if !ok {
-			return nil, fmt.Errorf("DeletedFinalStateUnknown contained non-Service object: %v", deletedState.Obj)
-		}
+func (s *Service) process(ctx context.Context, ch chan<- []*targetgroup.Group) bool {
+	keyObj, quit := s.queue.Get()
+	if quit {
+		return false
+	}
+	defer s.queue.Done(keyObj)
+	key := keyObj.(string)
+
+	namespace, name, err := cache.SplitMetaNamespaceKey(key)
+	if err != nil {
+		return true
 	}
 
-	return service, nil
+	o, exists, err := s.store.GetByKey(key)
+	if err != nil {
+		return true
+	}
+	if !exists {
+		send(ctx, ch, &targetgroup.Group{Source: serviceSourceFromNamespaceAndName(namespace, name)})
+		return true
+	}
+	eps, err := convertToService(o)
+	if err != nil {
+		s.logger.Error("converting to Service object failed", "err", err)
+		return true
+	}
+	send(ctx, ch, s.buildService(eps))
+	return true
+}
+
+func convertToService(o interface{}) (*apiv1.Service, error) {
+	service, ok := o.(*apiv1.Service)
+	if ok {
+		return service, nil
+	}
+	return nil, fmt.Errorf("received unexpected object: %v", o)
 }
 
 func serviceSource(s *apiv1.Service) string {
-	return "svc/" + s.Namespace + "/" + s.Name
+	return serviceSourceFromNamespaceAndName(s.Namespace, s.Name)
+}
+
+func serviceSourceFromNamespaceAndName(namespace, name string) string {
+	return "svc/" + namespace + "/" + name
 }
 
 const (
-	serviceNameLabel         = metaLabelPrefix + "service_name"
-	serviceLabelPrefix       = metaLabelPrefix + "service_label_"
-	serviceAnnotationPrefix  = metaLabelPrefix + "service_annotation_"
 	servicePortNameLabel     = metaLabelPrefix + "service_port_name"
+	servicePortNumberLabel   = metaLabelPrefix + "service_port_number"
 	servicePortProtocolLabel = metaLabelPrefix + "service_port_protocol"
+	serviceClusterIPLabel    = metaLabelPrefix + "service_cluster_ip"
+	serviceLoadBalancerIP    = metaLabelPrefix + "service_loadbalancer_ip"
+	serviceExternalNameLabel = metaLabelPrefix + "service_external_name"
+	serviceType              = metaLabelPrefix + "service_type"
 )
 
 func serviceLabels(svc *apiv1.Service) model.LabelSet {
-	ls := make(model.LabelSet, len(svc.Labels)+len(svc.Annotations)+2)
+	ls := make(model.LabelSet)
+	ls[namespaceLabel] = lv(svc.Namespace)
+	addObjectMetaLabels(ls, svc.ObjectMeta, RoleService)
 
-	ls[serviceNameLabel] = lv(svc.Name)
-
-	for k, v := range svc.Labels {
-		ln := strutil.SanitizeLabelName(serviceLabelPrefix + k)
-		ls[model.LabelName(ln)] = lv(v)
-	}
-
-	for k, v := range svc.Annotations {
-		ln := strutil.SanitizeLabelName(serviceAnnotationPrefix + k)
-		ls[model.LabelName(ln)] = lv(v)
-	}
 	return ls
 }
 
-func (s *Service) buildService(svc *apiv1.Service) *config.TargetGroup {
-	tg := &config.TargetGroup{
+func (s *Service) buildService(svc *apiv1.Service) *targetgroup.Group {
+	tg := &targetgroup.Group{
 		Source: serviceSource(svc),
 	}
 	tg.Labels = serviceLabels(svc)
-	tg.Labels[namespaceLabel] = lv(svc.Namespace)
 
 	for _, port := range svc.Spec.Ports {
 		addr := net.JoinHostPort(svc.Name+"."+svc.Namespace+".svc", strconv.FormatInt(int64(port.Port), 10))
 
-		tg.Targets = append(tg.Targets, model.LabelSet{
+		labelSet := model.LabelSet{
 			model.AddressLabel:       lv(addr),
 			servicePortNameLabel:     lv(port.Name),
+			servicePortNumberLabel:   lv(strconv.FormatInt(int64(port.Port), 10)),
 			servicePortProtocolLabel: lv(string(port.Protocol)),
-		})
+			serviceType:              lv(string(svc.Spec.Type)),
+		}
+
+		if svc.Spec.Type == apiv1.ServiceTypeExternalName {
+			labelSet[serviceExternalNameLabel] = lv(svc.Spec.ExternalName)
+		} else {
+			labelSet[serviceClusterIPLabel] = lv(svc.Spec.ClusterIP)
+		}
+
+		if svc.Spec.Type == apiv1.ServiceTypeLoadBalancer {
+			labelSet[serviceLoadBalancerIP] = lv(svc.Spec.LoadBalancerIP)
+		}
+
+		tg.Targets = append(tg.Targets, labelSet)
 	}
 
 	return tg
